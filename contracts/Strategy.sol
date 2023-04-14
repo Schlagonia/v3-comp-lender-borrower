@@ -138,7 +138,7 @@ contract Strategy is BaseTokenizedStrategy, UniswapV3Swapper {
         // for depositer to pull funds to deposit
         ERC20(baseToken).safeApprove(_depositer, type(uint256).max);
         // to sell reward tokens
-        ERC20(comp).safeApprove(address(router), type(uint256).max);
+        //ERC20(comp).safeApprove(address(router), type(uint256).max);
 
         // Set the needed variables for the Uni Swapper
         // Base will be weth.
@@ -242,6 +242,145 @@ contract Strategy is BaseTokenizedStrategy, UniswapV3Swapper {
             balanceOfCollateral() -
             baseTokenOwedInAsset();
     }
+
+    /*//////////////////////////////////////////////////////////////
+                    OPTIONAL TO OVERRIDE BY STRATEGIST
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @dev Optional function for strategist to override that can
+     *  be called in between reports.
+     *
+     * If '_tend' is used tendTrigger() will also need to be overridden.
+     *
+     * This call can only be called by a persionned role so may be
+     * through protected relays.
+     *
+     * This can be used to harvest and compound rewards, deposit idle funds,
+     * perform needed poisition maintence or anything else that doesn't need
+     * a full report for.
+     *
+     *   EX: A strategy that can not deposit funds without getting
+     *       sandwhiched can use the tend when a certain threshold
+     *       of idle to totalAssets has been reached.
+     *
+     * The TokenizedStrategy contract will do all needed debt and idle updates
+     * after this has finished and will have no effect on PPS of the strategy
+     * till report() is called.
+     *
+     * @param _totalIdle The current amount of idle funds that are available to invest.
+     */
+    function _tend(uint256 _totalIdle) internal override {
+        // Accrue account for accurate balances
+        comet.accrueAccount(address(this));
+
+        // If the cost to borrow > rewards rate we will pull out all funds to not report a loss
+        if (getNetBorrowApr(0) > getNetRewardApr(0)) {
+            // Liquidate everything so not to report a loss
+            _liquidatePosition(balanceOfCollateral());
+            // Return since we dont asset to do anything else
+            return;
+        }
+
+        _leveragePosition(_totalIdle);
+    }
+
+    /**
+     * @notice Returns wether or not tend() should be called by a keeper.
+     * @dev Optional trigger to override if tend() will be used by the strategy.
+     * This must be implemented if the strategy hopes to invoke _tend().
+     *
+     * @return . Should return true if tend() should be called by keeper or false if not.
+     */
+    function tendTrigger() public view override returns (bool) {
+        // if we are in danger of being liquidated tend no matter what
+        if (comet.isLiquidatable(address(this))) return true;
+
+        // we adjust position if:
+        // 1. LTV ratios are not in the HEALTHY range (either we take on more debt or repay debt)
+        // 2. costs are acceptable
+        uint256 collateralInUsd = _toUsd(balanceOfCollateral(), asset);
+
+        // Nothing to rebalance if we do not have collateral locked
+        if (collateralInUsd == 0) return false;
+
+        uint256 currentLTV = (_toUsd(balanceOfDebt(), baseToken) * 1e18) /
+            collateralInUsd;
+        uint256 targetLTV = _getTargetLTV();
+
+        // Check if we are over our warning LTV
+        if (currentLTV > _getWarningLTV()) {
+            // We have a higher tolerance for gas cost here since we are closer to liquidation
+            return
+                IBaseFeeGlobal(0xf8d0Ec04e94296773cE20eFbeeA82e76220cD549)
+                    .basefee_global() <= maxGasPriceToTend;
+        }
+
+        if (
+            // WE NEED TO TAKE ON MORE DEBT (we need a 10p.p (1000bps) difference)
+            (currentLTV < targetLTV && targetLTV - currentLTV > 1e17) ||
+            (getNetBorrowApr(0) > getNetRewardApr(0)) // UNHEALTHY BORROWING COSTS
+        ) {
+            return _isBaseFeeAcceptable();
+        }
+
+        return false;
+    }
+
+    /**
+     * @notice Gets the max amount of `asset` that an adress can deposit.
+     * @dev Defaults to an unlimited amount for any address. But can
+     * be overriden by strategists.
+     *
+     * This function will be called before any deposit or mints to enforce
+     * any limits desired by the strategist. This can be used for either a
+     * traditional deposit limit or for implementing a whitelist.
+     *
+     *   EX:
+     *      if(isAllowed[_owner]) return super.availableDepositLimit(_owner);
+     *
+     * This does not need to take into account any conversion rates
+     * from shares to assets.
+     *
+     * @param . The address that is depositing into the strategy.
+     * @return . The avialable amount the `_owner can deposit in terms of `asset`
+     */
+    function availableDepositLimit(
+        address /*_owner*/
+    ) public view override returns (uint256) {
+        return
+            uint256(
+                comet.getAssetInfoByAddress(asset).supplyCap -
+                    comet.totalsCollateral(asset).totalSupplyAsset
+            );
+    }
+
+    /*
+     * @notice Gets the max amount of `asset` that can be withdrawn.
+     * @dev Defaults to an unlimited amount for any address. But can
+     * be overriden by strategists.
+     *
+     * This function will be called before any withdraw or redeem to enforce
+     * any limits desired by the strategist. This can be used for illiquid
+     * or sandwhichable strategies. It should never be lower than `totalIdle`.
+     *
+     *   EX:
+     *       return TokenIzedStrategy.totalIdle();
+     *
+     * This does not need to take into account the `_owner`'s share balance
+     * or conversion rates from shares to assets.
+     *
+     * @param . The address that is withdrawing from the strategy.
+     * @return . The avialable amount that can be withdrawn in terms of `asset`
+     */
+    function availableWithdrawLimit(
+        address /*_owner*/
+    ) public view override returns (uint256) {
+        // TODO: THis doesnt make sense
+        return ERC20(baseToken).balanceOf(address(comet));
+    }
+
+    // ----------------- INTERNAL FUNCTIONS SUPPORT ----------------- \\
 
     function _leveragePosition(uint256 _amount) internal {
         // Cache variables
@@ -354,149 +493,6 @@ contract Strategy is BaseTokenizedStrategy, UniswapV3Swapper {
             _withdraw(asset, _maxWithdrawal());
         }
     }
-
-    /*//////////////////////////////////////////////////////////////
-                    OPTIONAL TO OVERRIDE BY STRATEGIST
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @dev Optional function for strategist to override that can
-     *  be called in between reports.
-     *
-     * If '_tend' is used tendTrigger() will also need to be overridden.
-     *
-     * This call can only be called by a persionned role so may be
-     * through protected relays.
-     *
-     * This can be used to harvest and compound rewards, deposit idle funds,
-     * perform needed poisition maintence or anything else that doesn't need
-     * a full report for.
-     *
-     *   EX: A strategy that can not deposit funds without getting
-     *       sandwhiched can use the tend when a certain threshold
-     *       of idle to totalAssets has been reached.
-     *
-     * The TokenizedStrategy contract will do all needed debt and idle updates
-     * after this has finished and will have no effect on PPS of the strategy
-     * till report() is called.
-     *
-     * @param _totalIdle The current amount of idle funds that are available to invest.
-     */
-    function _tend(uint256 _totalIdle) internal override {
-        // Accrue account for accurate balances
-        comet.accrueAccount(address(this));
-
-        // If the cost to borrow > rewards rate we will pull out all funds to not report a loss
-        if (getNetBorrowApr(0) > getNetRewardApr(0)) {
-            // Liquidate everything so not to report a loss
-            _liquidatePosition(balanceOfCollateral());
-            // Return since we dont asset to do anything else
-            return;
-        }
-
-        _leveragePosition(_totalIdle);
-    }
-
-    /**
-     * @notice Returns wether or not tend() should be called by a keeper.
-     * @dev Optional trigger to override if tend() will be used by the strategy.
-     * This must be implemented if the strategy hopes to invoke _tend().
-     *
-     * @return . Should return true if tend() should be called by keeper or false if not.
-     */
-    function tendTrigger() public view override returns (bool) {
-        // if we are in danger of being liquidated tend no matter what
-        if (comet.isLiquidatable(address(this))) return true;
-
-        // we adjust position if:
-        // 1. LTV ratios are not in the HEALTHY range (either we take on more debt or repay debt)
-        // 2. costs are acceptable
-        uint256 collateralInUsd = _toUsd(balanceOfCollateral(), asset);
-
-        // Nothing to rebalance if we do not have collateral locked
-        if (collateralInUsd == 0) return false;
-
-        uint256 currentLTV = (_toUsd(balanceOfDebt(), baseToken) * 1e18) /
-            collateralInUsd;
-        uint256 targetLTV = _getTargetLTV();
-
-        // Check if we are over our warning LTV
-        if (currentLTV > _getWarningLTV()) {
-            // We have a higher tolerance for gas cost here since we are closer to liquidation
-            return
-                IBaseFeeGlobal(0xf8d0Ec04e94296773cE20eFbeeA82e76220cD549)
-                    .basefee_global() <= maxGasPriceToTend;
-        }
-
-        if (
-            // WE NEED TO TAKE ON MORE DEBT (we need a 10p.p (1000bps) difference)
-            (currentLTV < targetLTV && targetLTV - currentLTV > 1e17) ||
-            (getNetBorrowApr(0) > getNetRewardApr(0)) // UNHEALTHY BORROWING COSTS
-        ) {
-            return _isBaseFeeAcceptable();
-        }
-
-        return false;
-    }
-
-    function _isBaseFeeAcceptable() internal view returns (bool) {
-        return true;
-    }
-
-    /**
-     * @notice Gets the max amount of `asset` that an adress can deposit.
-     * @dev Defaults to an unlimited amount for any address. But can
-     * be overriden by strategists.
-     *
-     * This function will be called before any deposit or mints to enforce
-     * any limits desired by the strategist. This can be used for either a
-     * traditional deposit limit or for implementing a whitelist.
-     *
-     *   EX:
-     *      if(isAllowed[_owner]) return super.availableDepositLimit(_owner);
-     *
-     * This does not need to take into account any conversion rates
-     * from shares to assets.
-     *
-     * @param . The address that is depositing into the strategy.
-     * @return . The avialable amount the `_owner can deposit in terms of `asset`
-     */
-    function availableDepositLimit(
-        address /*_owner*/
-    ) public view override returns (uint256) {
-        return
-            uint256(
-                comet.getAssetInfoByAddress(asset).supplyCap -
-                    comet.totalsCollateral(asset).totalSupplyAsset
-            );
-    }
-
-    /*
-     * @notice Gets the max amount of `asset` that can be withdrawn.
-     * @dev Defaults to an unlimited amount for any address. But can
-     * be overriden by strategists.
-     *
-     * This function will be called before any withdraw or redeem to enforce
-     * any limits desired by the strategist. This can be used for illiquid
-     * or sandwhichable strategies. It should never be lower than `totalIdle`.
-     *
-     *   EX:
-     *       return TokenIzedStrategy.totalIdle();
-     *
-     * This does not need to take into account the `_owner`'s share balance
-     * or conversion rates from shares to assets.
-     *
-     * @param . The address that is withdrawing from the strategy.
-     * @return . The avialable amount that can be withdrawn in terms of `asset`
-     */
-    function availableWithdrawLimit(
-        address /*_owner*/
-    ) public view override returns (uint256) {
-        // TODO: THis doesnt make sense
-        return ERC20(baseToken).balanceOf(address(comet));
-    }
-
-    // ----------------- INTERNAL FUNCTIONS SUPPORT -----------------
 
     function _withdrawFromDepositer(uint256 _amountBT) internal {
         uint256 balancePrior = balanceOfBaseToken();
@@ -777,6 +773,10 @@ contract Strategy is BaseTokenizedStrategy, UniswapV3Swapper {
 
             _swapFrom(asset, baseToken, baseStillOwed, maxAssetBalance);
         }
+    }
+
+    function _isBaseFeeAcceptable() internal view returns (bool) {
+        return true;
     }
 
     //Manual function available to management to withdraw from vault and repay debt
